@@ -1,0 +1,6 @@
+services:
+  sensor-publisher:
+    build:
+      context: ./app
+    env_file:
+      - .env
