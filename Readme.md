@@ -30,8 +30,8 @@ Ensure the following tools are installed on your system:
 Clone the repository using Git:
 
 ```bash
-git clone https://github.com/hanattaw/Iot-class-2025-sensor
-cd Iot-class-2025-sensor/iot-publisher
+git clone https://github.com/hanattaw/Iot-class-2025-publisher
+cd Iot-class-2025-publisher
 ```
 
 ---
@@ -39,7 +39,7 @@ cd Iot-class-2025-sensor/iot-publisher
 ## 💾 **Starting Container**
 ```bash
 # change to directory publisher
-$ cd ~/iot-class-2025-publisher
+$ cd ~/Iot-class-2025-publisher
 
 # build and start container
 $ docker compose up --build 
@@ -55,7 +55,7 @@ $ docker compose up --build
 ## 💾 **Stop and remove containers, networks**
 ```bash
 # change to directory publisher
-$ cd ~/iot-class-2025-publisher
+$ cd ~/Iot-class-2025-publisher
 
 # build and start container
 $ docker compose down --volumes --remove-orphans --rmi
