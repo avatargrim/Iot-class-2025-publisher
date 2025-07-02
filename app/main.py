@@ -68,7 +68,7 @@ async def publish_sensor(sensor_config):
                 while True:
                     temperature = round(random.uniform(18, 35), 2)
                     humidity = random.randint(30, 90)
-                    pressure = random.randint(980, 1050)
+                    pressure = random.randint(99990, 105000)
                     # luminosity = random.randint(100, 100000)
                     sensor_data = {
                         "id": sensor_config["id"],
