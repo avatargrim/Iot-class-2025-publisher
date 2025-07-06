@@ -8,44 +8,45 @@ from datetime import datetime
 import sys
 import logging
 
+# Fix Windows event loop policy (required for asyncio on Windows)
 if sys.platform.lower() == "win32" or os.name.lower() == "nt":
     from asyncio import set_event_loop_policy, WindowsSelectorEventLoopPolicy
     set_event_loop_policy(WindowsSelectorEventLoopPolicy())
 
-# Load environment variables (useful when working locally)
+# Load environment variables from .env file
 from dotenv import load_dotenv
-load_dotenv(os.path.dirname(os.path.abspath(__file__))+"/.env")
+load_dotenv(os.path.dirname(os.path.abspath(__file__)) + "/.env")
 
-# get MQTT configure
-MQTT_BROKER = os.getenv("MQTT_GATEWAY", "localhost") # user MQTT_GATEWAY to publish as sensors
+# Load MQTT configuration from environment variables
+MQTT_BROKER = os.getenv("MQTT_GATEWAY", "localhost")
 MQTT_TOPIC = os.getenv("MQTT_TOPIC", "iot-frames-model")
 MQTT_PORT = os.getenv("MQTT_PORT", "1883")
 MQTT_QOS = os.getenv("MQTT_QOS", "1")
-MQTT_QOS = os.getenv("MQTT_QOS", "1")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
-# Logggin env
-log_level_str = os.getenv("LOG_LEVEL", "INFO").upper()
+# Configure logging
+log_level_str = LOG_LEVEL.upper()
 log_level = getattr(logging, log_level_str, logging.INFO)
-
 logging.basicConfig(
     level=log_level,
     format='[%(asctime)s] [%(levelname)s] %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
+# Get sensor IDs from environment variable and generate sensor configs
+sensor_ids_str = os.getenv("SENSOR_IDS", "0")
+sensor_ids = [int(x.strip()) for x in sensor_ids_str.split(",") if x.strip().isdigit()]
 sensor_configs = [
     {
         "id": f"{i:03}{i:03}{i:03}",
         "name": f"iot_sensor_{i}",
         "place_id": f"{i:03}{i:03}{i:03}"
     }
-    for i in range(0, 1)
+    for i in sensor_ids
 ]
 
-# สามารถปรับให้ใช้ร่วมกับ CO₂, PM2.5, AQI, หรือ luminosity ได้ในอนาคต
+# Logic to determine fan speed based on sensor values (rule-based)
 def calculate_fan_speed(temp, humidity, pressure=None, luminosity=None):
-    # ความสำคัญหลัก: อุณหภูมิและความชื้น
     if temp > 30 or humidity > 80:
         return 3
     elif temp > 27 or humidity > 70:
@@ -53,12 +54,12 @@ def calculate_fan_speed(temp, humidity, pressure=None, luminosity=None):
     elif temp > 24 or humidity > 60:
         return 1
 
-    # กรณีสภาพอื่น ๆ แม้ temp/humidity ต่ำ แต่ pressure/luminosity สูง
     if pressure and pressure < 990:
-        return 2  # แรงดันต่ำ = อากาศแปรปรวน อาจเร่งระบาย
+        return 2  # Low pressure may indicate unstable weather
 
-    return 0  # ปกติ ไม่ร้อน ไม่ชื้น ไม่ต้องเปิด
-    
+    return 0  # No need to turn on the fan
+
+# Coroutine to publish sensor data repeatedly
 async def publish_sensor(sensor_config):
     while True:
         try:
@@ -66,44 +67,53 @@ async def publish_sensor(sensor_config):
             async with Client(MQTT_BROKER) as client:
                 logging.info(f"[{sensor_config['name']}] Connected: {MQTT_BROKER}:{MQTT_PORT}")
                 while True:
+                    # Randomly generate sensor readings
                     temperature = round(random.uniform(18, 35), 2)
                     humidity = random.randint(30, 90)
                     pressure = random.randint(99990, 105000)
-                    # luminosity = random.randint(100, 100000)
+
+                    # Construct the message payload
                     sensor_data = {
                         "id": sensor_config["id"],
                         "name": sensor_config["name"],
                         "place_id": sensor_config["place_id"],
-                        # Update timestamp and formatted date each time
-                        # "timestamp" : int(time.time() * 1000),  # Current time in milliseconds
-                        # "date" : time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),  # UTC date-time
                         "payload": {
                             "temperature": temperature,
                             "humidity": humidity,
                             "pressure": pressure,
-                            "fan_speed": calculate_fan_speed(temperature, humidity, pressure)  # 0=off, 1=low, 2=medium, 3=high
+                            # Only include fan_speed if this is the ground-truth sensor
+                            # Model will predict for others
                         }
                     }
 
+                    # Add fan_speed only for iot_sensor_0 (ground-truth)
+                    if sensor_config["name"] == "iot_sensor_0":
+                        sensor_data["payload"]["fan_speed"] = calculate_fan_speed(temperature, humidity, pressure)
+
+                    # Encode message and publish
                     message = json.dumps(sensor_data)
                     await client.publish(topic=MQTT_TOPIC, payload=message.encode(), qos=int(MQTT_QOS))
+
+                    # Log message details
                     logging.info(f"GATEWAY: {MQTT_BROKER} PORT={MQTT_PORT} TOPIC={MQTT_TOPIC} QOS={MQTT_QOS}")
                     logging.info(f"PUBLISHED: sensor_name: {sensor_config['name']}")
                     logging.info(f"MESSAGE: {message}")
                     logging.info(f"TOTAL PACKAGE SIZE: topic={len(MQTT_TOPIC.encode())} + message={len(message.encode())} = {len(MQTT_TOPIC.encode()) + len(message.encode())} Bytes\n")
 
-                    # await asyncio.sleep(random.uniform(1, 2))
+                    # Wait before next publish
                     await asyncio.sleep(5)
 
         except Exception as e:
-            logging.error(f"[[{sensor_config['name']}] Connection error: {e}")
-            logging.error(f"[[{sensor_config['name']}] Reconnecting in 5 seconds...\n")
+            # Handle connection or publishing errors
+            logging.error(f"[{sensor_config['name']}] Connection error: {e}")
+            logging.error(f"[{sensor_config['name']}] Reconnecting in 5 seconds...\n")
             await asyncio.sleep(5)
 
-
+# Run all sensor publishers concurrently
 async def main():
     await asyncio.gather(*(publish_sensor(config) for config in sensor_configs))
 
+# Start the asyncio application
 if __name__ == "__main__":
     try:
         asyncio.run(main())

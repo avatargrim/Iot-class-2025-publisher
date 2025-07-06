@@ -3,7 +3,7 @@
 A Dockerized sample IoT publisher application that simulates sensor data and publishes it to a broker or stream processor (e.g., MQTT, Kafka).
 
 ```
-iot-publisher/
+Iot-class-2025-publisher/
 ├── app/
 │   ├── Dockerfile
 │   ├── main.py
