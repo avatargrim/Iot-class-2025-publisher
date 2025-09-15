@@ -1,121 +1,155 @@
 import asyncio
-import time
 import json
-import random
-from aiomqtt import Client
 import os
-from datetime import datetime
 import sys
 import logging
+from datetime import datetime
+from typing import List, Dict, Any
 
-# Fix Windows event loop policy (required for asyncio on Windows)
-if sys.platform.lower() == "win32" or os.name.lower() == "nt":
+import pandas as pd
+from aiomqtt import Client
+
+# Windows asyncio policy (needed for some Python builds on Windows)
+if sys.platform.lower().startswith("win") or os.name.lower() == "nt":
     from asyncio import set_event_loop_policy, WindowsSelectorEventLoopPolicy
     set_event_loop_policy(WindowsSelectorEventLoopPolicy())
 
-# Load environment variables from .env file
+# -------- Load .env --------
+# Try to load both: project root `.env` and app local `.env`
 from dotenv import load_dotenv
-load_dotenv(os.path.dirname(os.path.abspath(__file__)) + "/.env")
 
-# Load MQTT configuration from environment variables
-MQTT_BROKER = os.getenv("MQTT_GATEWAY", "localhost")
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.abspath(os.path.join(APP_DIR, ".."))
+for env_path in (os.path.join(ROOT_DIR, ".env"), os.path.join(APP_DIR, ".env")):
+    if os.path.exists(env_path):
+        load_dotenv(env_path, override=False)
+
+# -------- Configs --------
+MQTT_BROKER = os.getenv("MQTT_GATEWAY") or os.getenv("MQTT_BROKER", "localhost")
+MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 MQTT_TOPIC = os.getenv("MQTT_TOPIC", "iot-frames-model")
-MQTT_PORT = os.getenv("MQTT_PORT", "1883")
-MQTT_QOS = os.getenv("MQTT_QOS", "1")
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+MQTT_QOS = int(os.getenv("MQTT_QOS", "1"))
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
-# Configure logging
-log_level_str = LOG_LEVEL.upper()
-log_level = getattr(logging, log_level_str, logging.INFO)
+CSV_PATH = os.getenv("CSV_PATH", os.path.join(APP_DIR, "Air_Quality.csv"))
+# Publish interval (seconds) between rows
+PUBLISH_DELAY = float(os.getenv("PUBLISH_DELAY", "0.1"))
+# once: publish each row exactly once; loop: restart at top after reaching the end
+PUBLISH_MODE = os.getenv("PUBLISH_MODE", "once").lower()  # "once" or "loop"
+
+# Optional static identity fields if CSV does not include them
+SENSOR_ID = os.getenv("SENSOR_ID", "000000")
+SENSOR_NAME = os.getenv("SENSOR_NAME", "iot_sensor_csv")
+PLACE_ID = os.getenv("PLACE_ID", "000000")
+
 logging.basicConfig(
-    level=log_level,
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
     format='[%(asctime)s] [%(levelname)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    datefmt='%Y-%m-%d %H:%M:%S',
 )
 
-# Get sensor IDs from environment variable and generate sensor configs
-sensor_ids_str = os.getenv("SENSOR_IDS", "0")
-sensor_ids = [int(x.strip()) for x in sensor_ids_str.split(",") if x.strip().isdigit()]
-sensor_configs = [
-    {
-        "id": f"{i:03}{i:03}{i:03}",
-        "name": f"iot_sensor_{i}",
-        "place_id": f"{i:03}{i:03}{i:03}"
-    }
-    for i in sensor_ids
-]
+# -------- Helpers --------
+def df_to_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """
+    Convert a DataFrame into a list of payload dicts expected by downstream consumers.
+    If the CSV already contains id/name/place_id columns, use them; otherwise inject static ones.
+    Recognizes a variety of timestamp column names and converts to ISO 8601.
+    """
+    # Try to detect a timestamp-like column
+    ts_candidates = [
+        "timestamp", "time", "datetime", "date", "DeviceTimeStamp",
+        "Timestamp", "Time", "DateTime", "Date"
+    ]
+    ts_col = next((c for c in ts_candidates if c in df.columns), None)
 
-# Logic to determine fan speed based on sensor values (rule-based)
-def calculate_fan_speed(temp, humidity, pressure=None, luminosity=None):
-    if temp > 30 or humidity > 80:
-        return 3
-    elif temp > 27 or humidity > 70:
-        return 2
-    elif temp > 24 or humidity > 60:
-        return 1
+    records: List[Dict[str, Any]] = []
+    for _, row in df.iterrows():
+        # Prepare identity
+        rid = str(row.get("id", row.get("sensor_id", SENSOR_ID)))
+        rname = str(row.get("name", row.get("sensor_name", SENSOR_NAME)))
+        rplace = str(row.get("place_id", PLACE_ID))
 
-    if pressure and pressure < 990:
-        return 2  # Low pressure may indicate unstable weather
+        # Build payload: include every numeric or string column except the identity fields
+        payload = {}
+        for col, val in row.items():
+            if col in {"id", "sensor_id", "name", "sensor_name", "place_id"}:
+                continue
+            # Convert pandas NaN to None
+            if pd.isna(val):
+                payload[col] = None
+            else:
+                # Timestamps normalization
+                if ts_col and col == ts_col:
+                    try:
+                        payload[col] = pd.to_datetime(val).isoformat()
+                    except Exception:
+                        payload[col] = str(val)
+                else:
+                    payload[col] = val
 
-    return 0  # No need to turn on the fan
+        # If there was no explicit timestamp column, add one
+        if ts_col is None:
+            payload["timestamp"] = datetime.utcnow().isoformat()
 
-# Coroutine to publish sensor data repeatedly
-async def publish_sensor(sensor_config):
-    while True:
-        try:
-            logging.info(f"[{sensor_config['name']}] Connecting: {MQTT_BROKER}:{MQTT_PORT} ...")
-            async with Client(MQTT_BROKER) as client:
-                logging.info(f"[{sensor_config['name']}] Connected: {MQTT_BROKER}:{MQTT_PORT}")
-                while True:
-                    # Randomly generate sensor readings
-                    temperature = round(random.uniform(18, 35), 2)
-                    humidity = random.randint(30, 90)
-                    pressure = random.randint(99990, 105000)
+        record = {
+            "id": rid,
+            "name": rname,
+            "place_id": rplace,
+            "payload": payload,
+        }
+        records.append(record)
+    return records
 
-                    # Construct the message payload
-                    sensor_data = {
-                        "id": sensor_config["id"],
-                        "name": sensor_config["name"],
-                        "place_id": sensor_config["place_id"],
-                        "payload": {
-                            "temperature": temperature,
-                            "humidity": humidity,
-                            "pressure": pressure,
-                            # Only include fan_speed if this is the ground-truth sensor
-                            # Model will predict for others
-                        }
-                    }
 
-                    # Add fan_speed only for iot_sensor_0 (ground-truth)
-                    if sensor_config["name"] == "iot_sensor_0":
-                        sensor_data["payload"]["fan_speed"] = calculate_fan_speed(temperature, humidity, pressure)
+async def publish_from_csv(records: List[Dict[str, Any]]):
+    """
+    Connect once and stream each record as a JSON message.
+    """
+    logging.info(f"Connecting to MQTT {MQTT_BROKER}:{MQTT_PORT} topic={MQTT_TOPIC} qos={MQTT_QOS}")
+    async with Client(MQTT_BROKER, port=MQTT_PORT) as client:
+        logging.info("Connected to MQTT broker.")
+        index = 0
+        total = len(records)
 
-                    # Encode message and publish
-                    message = json.dumps(sensor_data)
-                    await client.publish(topic=MQTT_TOPIC, payload=message.encode(), qos=int(MQTT_QOS))
+        while True:
+            if index >= total:
+                if PUBLISH_MODE == "loop":
+                    index = 0
+                else:
+                    logging.info("Finished publishing all CSV rows (mode=once).")
+                    break
 
-                    # Log message details
-                    logging.info(f"GATEWAY: {MQTT_BROKER} PORT={MQTT_PORT} TOPIC={MQTT_TOPIC} QOS={MQTT_QOS}")
-                    logging.info(f"PUBLISHED: sensor_name: {sensor_config['name']}")
-                    logging.info(f"MESSAGE: {message}")
-                    logging.info(f"TOTAL PACKAGE SIZE: topic={len(MQTT_TOPIC.encode())} + message={len(message.encode())} = {len(MQTT_TOPIC.encode()) + len(message.encode())} Bytes\n")
+            msg_obj = records[index]
+            msg_str = json.dumps(msg_obj, ensure_ascii=False)
+            await client.publish(topic=MQTT_TOPIC, payload=msg_str.encode("utf-8"), qos=MQTT_QOS)
 
-                    # Wait before next publish
-                    await asyncio.sleep(5)
+            logging.info(
+                f"PUBLISHED row={index+1}/{total} bytes={len(msg_str.encode('utf-8'))} "
+                f"topic={MQTT_TOPIC} qos={MQTT_QOS}"
+            )
+            logging.debug(f"MESSAGE: {msg_str}")
 
-        except Exception as e:
-            # Handle connection or publishing errors
-            logging.error(f"[{sensor_config['name']}] Connection error: {e}")
-            logging.error(f"[{sensor_config['name']}] Reconnecting in 5 seconds...\n")
-            await asyncio.sleep(5)
+            index += 1
+            await asyncio.sleep(PUBLISH_DELAY)
 
-# Run all sensor publishers concurrently
+
 async def main():
-    await asyncio.gather(*(publish_sensor(config) for config in sensor_configs))
+    if not os.path.exists(CSV_PATH):
+        raise FileNotFoundError(f"CSV not found: {CSV_PATH}")
 
-# Start the asyncio application
+    logging.info(f"Loading CSV: {CSV_PATH}")
+    df = pd.read_csv(CSV_PATH)
+    if df.empty:
+        logging.warning("CSV is empty. Nothing to publish.")
+        return
+
+    records = df_to_records(df)
+    logging.info(f"Prepared {len(records)} records from CSV.")
+    await publish_from_csv(records)
+
+
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logging.info(f"Shutdown requested. Exiting...")
+        logging.info("Shutdown requested. Exiting...")
