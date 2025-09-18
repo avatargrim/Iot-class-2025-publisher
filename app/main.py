@@ -33,7 +33,7 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 CSV_PATH = os.getenv("CSV_PATH", os.path.join(APP_DIR, "Air_Quality.csv"))
 # Publish interval (seconds) between rows
-PUBLISH_DELAY = float(os.getenv("PUBLISH_DELAY", "0.1"))
+PUBLISH_DELAY = float(os.getenv("PUBLISH_DELAY", "5"))
 # once: publish each row exactly once; loop: restart at top after reaching the end
 PUBLISH_MODE = os.getenv("PUBLISH_MODE", "loop").lower()  # "once" or "loop"
 
